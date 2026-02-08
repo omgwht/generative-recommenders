@@ -1,0 +1,5 @@
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+torchrec==1.1.0+cu118
+fbgemm-gpu==1.1.0+cu118

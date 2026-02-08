@@ -102,6 +102,42 @@ def get_reco_dataset(
             shift_id_by=1,  # [0..n-1] -> [1..n]
             chronological=chronological,
         )
+    elif dataset_name == "epinions":
+        dp = get_common_preprocessors()[dataset_name]
+        train_dataset = DatasetV2(
+            ratings_file=dp.sasrec_format_csv_by_user_train(),
+            padding_length=max_sequence_length + 1,  # target
+            ignore_last_n=0,  # already split by files
+            shift_id_by=1,  # [0..n-1] -> [1..n]
+            chronological=chronological,
+            sample_ratio=positional_sampling_ratio,
+        )
+        eval_dataset = DatasetV2(
+            ratings_file=dp.sasrec_format_csv_by_user_test(),
+            padding_length=max_sequence_length + 1,  # target
+            ignore_last_n=0,  # already split by files
+            shift_id_by=1,  # [0..n-1] -> [1..n]
+            chronological=chronological,
+            sample_ratio=1.0,
+        )
+    elif dataset_name == "yelp":
+        dp = get_common_preprocessors()[dataset_name]
+        train_dataset = DatasetV2(
+            ratings_file=dp.sasrec_format_csv_by_user_train(),
+            padding_length=max_sequence_length + 1,  # target
+            ignore_last_n=0,  # already split by files
+            shift_id_by=1,  # [0..n-1] -> [1..n]
+            chronological=chronological,
+            sample_ratio=positional_sampling_ratio,
+        )
+        eval_dataset = DatasetV2(
+            ratings_file=dp.sasrec_format_csv_by_user_test(),
+            padding_length=max_sequence_length + 1,  # target
+            ignore_last_n=0,  # already split by files
+            shift_id_by=1,  # [0..n-1] -> [1..n]
+            chronological=chronological,
+            sample_ratio=1.0,
+        )
     else:
         raise ValueError(f"Unknown dataset {dataset_name}")
 
