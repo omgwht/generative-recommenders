@@ -39,6 +39,7 @@ def get_reco_dataset(
     max_sequence_length: int,
     chronological: bool,
     positional_sampling_ratio: float = 1.0,
+    eval_split: str = "test",
 ) -> RecoDataset:
     if dataset_name == "ml-1m":
         dp = get_common_preprocessors()[dataset_name]
@@ -104,6 +105,16 @@ def get_reco_dataset(
         )
     elif dataset_name == "epinions":
         dp = get_common_preprocessors()[dataset_name]
+        if eval_split not in ("valid", "test"):
+            raise ValueError(
+                f"Unsupported eval_split={eval_split} for dataset {dataset_name}. "
+                "Expected one of: valid, test."
+            )
+        eval_ratings_file = (
+            dp.sasrec_format_csv_by_user_valid()
+            if eval_split == "valid"
+            else dp.sasrec_format_csv_by_user_test()
+        )
         train_dataset = DatasetV2(
             ratings_file=dp.sasrec_format_csv_by_user_train(),
             padding_length=max_sequence_length + 1,  # target
@@ -113,7 +124,7 @@ def get_reco_dataset(
             sample_ratio=positional_sampling_ratio,
         )
         eval_dataset = DatasetV2(
-            ratings_file=dp.sasrec_format_csv_by_user_test(),
+            ratings_file=eval_ratings_file,
             padding_length=max_sequence_length + 1,  # target
             ignore_last_n=0,  # already split by files
             shift_id_by=1,  # [0..n-1] -> [1..n]
@@ -122,6 +133,16 @@ def get_reco_dataset(
         )
     elif dataset_name == "yelp":
         dp = get_common_preprocessors()[dataset_name]
+        if eval_split not in ("valid", "test"):
+            raise ValueError(
+                f"Unsupported eval_split={eval_split} for dataset {dataset_name}. "
+                "Expected one of: valid, test."
+            )
+        eval_ratings_file = (
+            dp.sasrec_format_csv_by_user_valid()
+            if eval_split == "valid"
+            else dp.sasrec_format_csv_by_user_test()
+        )
         train_dataset = DatasetV2(
             ratings_file=dp.sasrec_format_csv_by_user_train(),
             padding_length=max_sequence_length + 1,  # target
@@ -131,7 +152,7 @@ def get_reco_dataset(
             sample_ratio=positional_sampling_ratio,
         )
         eval_dataset = DatasetV2(
-            ratings_file=dp.sasrec_format_csv_by_user_test(),
+            ratings_file=eval_ratings_file,
             padding_length=max_sequence_length + 1,  # target
             ignore_last_n=0,  # already split by files
             shift_id_by=1,  # [0..n-1] -> [1..n]

@@ -1029,6 +1029,48 @@ class YelpDataProcessor(DataProcessor):
             ],
         )
 
+    def _filter_targets_after_train_history(
+        self,
+        train_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        split_name: str,
+    ) -> pd.DataFrame:
+        if target_df.empty:
+            logging.info(
+                f"{self._prefix}: split={split_name} has 0 rows before strict-chrono filtering."
+            )
+            return target_df
+
+        train_last_timestamp = (
+            train_df.groupby("mapped_user_id", sort=False)["timestamp"]
+            .max()
+            .rename("train_last_timestamp")
+        )
+        target_with_history = target_df.join(
+            train_last_timestamp,
+            on="mapped_user_id",
+        )
+
+        missing_history_mask = target_with_history["train_last_timestamp"].isna()
+        non_future_mask = (~missing_history_mask) & (
+            target_with_history["timestamp"]
+            <= target_with_history["train_last_timestamp"]
+        )
+        keep_mask = (~missing_history_mask) & (~non_future_mask)
+        filtered_target_df = (
+            target_with_history.loc[keep_mask]
+            .drop(columns=["train_last_timestamp"])
+            .reset_index(drop=True)
+        )
+
+        logging.info(
+            f"{self._prefix}: strict-chrono split={split_name}, "
+            f"kept={int(keep_mask.sum())}/{len(target_df)}, "
+            f"dropped_no_history={int(missing_history_mask.sum())}, "
+            f"dropped_not_after_train={int(non_future_mask.sum())}."
+        )
+        return filtered_target_df
+
     def preprocess_rating(self) -> int:
         user_map = self._load_jsonl_id_map(
             filename="yelp_user.json",
@@ -1073,6 +1115,27 @@ class YelpDataProcessor(DataProcessor):
             )
             for split in ["train", "valid", "test"]
         }
+        strict_split_to_df = {
+            "train": split_to_df["train"],
+            "valid": self._filter_targets_after_train_history(
+                train_df=split_to_df["train"],
+                target_df=split_to_df["valid"],
+                split_name="valid",
+            ),
+            "test": self._filter_targets_after_train_history(
+                train_df=split_to_df["train"],
+                target_df=split_to_df["test"],
+                split_name="test",
+            ),
+        }
+        if strict_split_to_df["valid"].empty:
+            raise ValueError(
+                f"{self._prefix}: strict-chrono filtering removed all valid rows."
+            )
+        if strict_split_to_df["test"].empty:
+            raise ValueError(
+                f"{self._prefix}: strict-chrono filtering removed all test rows."
+            )
 
         os.makedirs(f"tmp/{self._prefix}", exist_ok=True)
         os.makedirs(f"tmp/processed/{self._prefix}", exist_ok=True)
@@ -1085,19 +1148,19 @@ class YelpDataProcessor(DataProcessor):
         ).sort_values(by=["mapped_id"]).to_csv(self.processed_item_csv(), index=False)
 
         for split in ["train", "valid", "test"]:
-            split_to_df[split].to_csv(
+            strict_split_to_df[split].to_csv(
                 f"tmp/processed/{self._prefix}/interactions_{split}.csv",
                 index=False,
             )
 
-        seq_train = self._build_train_sequence_df(split_to_df["train"])
+        seq_train = self._build_train_sequence_df(strict_split_to_df["train"])
         seq_valid = self._build_eval_sequence_df(
-            history_df=split_to_df["train"],
-            target_df=split_to_df["valid"],
+            history_df=strict_split_to_df["train"],
+            target_df=strict_split_to_df["valid"],
         )
         seq_test = self._build_eval_sequence_df(
-            history_df=split_to_df["train"],
-            target_df=split_to_df["test"],
+            history_df=strict_split_to_df["train"],
+            target_df=strict_split_to_df["test"],
         )
 
         seq_train.sample(frac=1).reset_index(drop=True).to_csv(
@@ -1121,10 +1184,12 @@ class YelpDataProcessor(DataProcessor):
             )
 
         logging.info(
-            f"{self._prefix}: train/valid/test rows="
-            f"{len(split_to_df['train'])}/"
-            f"{len(split_to_df['valid'])}/"
-            f"{len(split_to_df['test'])}, "
+            f"{self._prefix}: strict-chrono rows train/valid/test="
+            f"{len(strict_split_to_df['train'])}/"
+            f"{len(strict_split_to_df['valid'])}/"
+            f"{len(strict_split_to_df['test'])} "
+            f"(raw valid/test before filter="
+            f"{len(split_to_df['valid'])}/{len(split_to_df['test'])}), "
             f"#items={num_unique_items}."
         )
         return num_unique_items

@@ -3,7 +3,9 @@
 # pyre-unsafe
 
 import argparse
+import json
 import inspect
+import os
 import time
 from collections import defaultdict
 from typing import Any, Dict
@@ -66,7 +68,10 @@ def _get_train_hparam(name: str) -> Any:
         return default_value
 
 
-def _build_model_and_dataset(device: str) -> tuple[torch.nn.Module, Any, Dict[str, Any]]:
+def _build_model_and_dataset(
+    device: str,
+    eval_split: str,
+) -> tuple[torch.nn.Module, Any, Dict[str, Any]]:
     hparams = {
         "dataset_name": _get_train_hparam("dataset_name"),
         "max_sequence_length": _get_train_hparam("max_sequence_length"),
@@ -91,6 +96,7 @@ def _build_model_and_dataset(device: str) -> tuple[torch.nn.Module, Any, Dict[st
         max_sequence_length=hparams["max_sequence_length"],
         chronological=True,
         positional_sampling_ratio=1.0,
+        eval_split=eval_split,
     )
 
     if hparams["embedding_module_type"] != "local":
@@ -241,10 +247,28 @@ def main() -> None:
     parser.add_argument("--checkpoint_path", required=True, type=str)
     parser.add_argument("--device", default="", type=str)
     parser.add_argument(
+        "--eval_split",
+        default="test",
+        choices=["valid", "test"],
+        help="Which split to evaluate on.",
+    )
+    parser.add_argument(
         "--max_batches",
         default=0,
         type=int,
         help="For debugging only: evaluate first N batches (0 means full eval).",
+    )
+    parser.add_argument(
+        "--metrics_out",
+        default="",
+        type=str,
+        help="Optional path to save all metrics as JSON.",
+    )
+    parser.add_argument(
+        "--key_metrics_out",
+        default="",
+        type=str,
+        help="Optional path to save key metrics (recall/ndcg/hr/mrr) as plain text.",
     )
     args = parser.parse_args()
 
@@ -256,11 +280,26 @@ def main() -> None:
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Requested CUDA evaluation but torch.cuda.is_available() is False. "
+            "Please check GPU visibility in gr26."
+        )
+    if not hasattr(torch.ops.fbgemm, "asynchronous_complete_cumsum"):
+        raise RuntimeError(
+            "Missing fbgemm operator asynchronous_complete_cumsum. "
+            "Please ensure fbgemm_gpu is installed/compatible in gr26."
+        )
+
     print(f"[info] device={device}")
-    model, dataset, hparams = _build_model_and_dataset(device=device)
+    model, dataset, hparams = _build_model_and_dataset(
+        device=device,
+        eval_split=args.eval_split,
+    )
     print(
         "[info] dataset="
-        f"{hparams['dataset_name']} eval_rows={len(dataset.eval_dataset)} "
+        f"{hparams['dataset_name']} eval_split={args.eval_split} "
+        f"eval_rows={len(dataset.eval_dataset)} "
         f"batch_size={hparams['eval_batch_size']}"
     )
 
@@ -298,6 +337,21 @@ def main() -> None:
     for key in sorted(metrics.keys()):
         if key not in preferred:
             print(f"{key}: {metrics[key]:.6f}")
+
+    if args.metrics_out:
+        os.makedirs(os.path.dirname(args.metrics_out) or ".", exist_ok=True)
+        with open(args.metrics_out, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+        print(f"[info] wrote metrics json to {args.metrics_out}")
+
+    if args.key_metrics_out:
+        os.makedirs(os.path.dirname(args.key_metrics_out) or ".", exist_ok=True)
+        keys = ["recall@10", "recall@20", "ndcg@10", "ndcg@20", "hr@10", "hr@20", "mrr"]
+        with open(args.key_metrics_out, "w", encoding="utf-8") as f:
+            for key in keys:
+                if key in metrics:
+                    f.write(f"{key}: {metrics[key]:.6f}\n")
+        print(f"[info] wrote key metrics to {args.key_metrics_out}")
 
 
 if __name__ == "__main__":

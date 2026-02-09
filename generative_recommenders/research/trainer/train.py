@@ -128,6 +128,13 @@ def train_fn(
     l2_norm_eps: float = 1e-6,
     enable_tf32: bool = False,
     random_seed: int = 42,
+    eval_split: str = "test",
+    model_selection_weights: Optional[Dict[str, float]] = None,
+    save_best_checkpoint: bool = False,
+    early_stop_patience: int = 0,
+    early_stop_min_epochs: int = 0,
+    early_stop_min_delta: float = 0.0,
+    early_stop_full_eval_only: bool = True,
 ) -> None:
     # to enable more deterministic results.
     random.seed(random_seed)
@@ -143,6 +150,11 @@ def train_fn(
         max_sequence_length=max_sequence_length,
         chronological=True,
         positional_sampling_ratio=positional_sampling_ratio,
+        eval_split=eval_split,
+    )
+    logging.info(
+        f"rank {rank}: dataset={dataset_name}, eval_split={eval_split}, "
+        f"train_rows={len(dataset.train_dataset)}, eval_rows={len(dataset.eval_dataset)}"
     )
 
     train_data_sampler, train_data_loader = create_data_loader(
@@ -293,12 +305,42 @@ def train_fn(
         writer = None
         logging.info(f"Rank {rank}: disabling summary writer")
 
+    if model_selection_weights is None:
+        # Prioritize metrics emphasized in retrieval quality discussions.
+        model_selection_weights = {
+            "ndcg@10": 1.0,
+            "ndcg@20": 2.0,
+            "hr@10": 1.0,
+            "hr@20": 2.0,
+        }
+
+    def get_model_selection_score(metrics: Dict[str, float]) -> float:
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for metric_name, metric_weight in model_selection_weights.items():
+            if metric_name not in metrics:
+                continue
+            weighted_sum += metric_weight * metrics[metric_name]
+            total_weight += abs(metric_weight)
+        if total_weight > 0.0:
+            return weighted_sum / total_weight
+        # Fallback for unexpected configs.
+        if "ndcg@20" in metrics:
+            return metrics["ndcg@20"]
+        return metrics["ndcg@10"]
+
+    best_selection_score = float("-inf")
+    best_epoch = -1
+    num_no_improve_epochs = 0
+    best_ckpt_path = f"./ckpts/{model_desc}_best"
+
     last_training_time = time.time()
     torch.autograd.set_detect_anomaly(True)
 
     batch_id = 0
     epoch = 0
     for epoch in range(num_epochs):
+        stop_training = False
         if train_data_sampler is not None:
             train_data_sampler.set_epoch(epoch)
         if eval_data_sampler is not None:
@@ -479,10 +521,22 @@ def train_fn(
             eval_dict_all[k] = torch.cat(v, dim=-1)
 
         ndcg_10 = _avg(eval_dict_all["ndcg@10"], world_size=world_size)
+        ndcg_20 = _avg(eval_dict_all["ndcg@20"], world_size=world_size)
         ndcg_50 = _avg(eval_dict_all["ndcg@50"], world_size=world_size)
         hr_10 = _avg(eval_dict_all["hr@10"], world_size=world_size)
+        hr_20 = _avg(eval_dict_all["hr@20"], world_size=world_size)
         hr_50 = _avg(eval_dict_all["hr@50"], world_size=world_size)
         mrr = _avg(eval_dict_all["mrr"], world_size=world_size)
+        eval_metrics = {
+            "ndcg@10": float(ndcg_10.item()),
+            "ndcg@20": float(ndcg_20.item()),
+            "ndcg@50": float(ndcg_50.item()),
+            "hr@10": float(hr_10.item()),
+            "hr@20": float(hr_20.item()),
+            "hr@50": float(hr_50.item()),
+            "mrr": float(mrr.item()),
+        }
+        selection_score = get_model_selection_score(eval_metrics)
 
         add_to_summary_writer(
             writer,
@@ -491,6 +545,8 @@ def train_fn(
             prefix="eval_epoch",
             world_size=world_size,
         )
+        if rank == 0 and writer is not None:
+            writer.add_scalar("selection/score", selection_score, epoch)
         if full_eval_every_n > 1 and is_full_eval(epoch):
             add_to_summary_writer(
                 writer,
@@ -499,6 +555,42 @@ def train_fn(
                 prefix="eval_epoch_full",
                 world_size=world_size,
             )
+        should_update_model_selection = (not early_stop_full_eval_only) or is_full_eval(
+            epoch
+        )
+        if should_update_model_selection:
+            if selection_score > best_selection_score + early_stop_min_delta:
+                best_selection_score = selection_score
+                best_epoch = epoch
+                num_no_improve_epochs = 0
+                if rank == 0 and save_best_checkpoint:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "selection_score": selection_score,
+                            "selection_metrics": eval_metrics,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": opt.state_dict(),
+                        },
+                        best_ckpt_path,
+                    )
+                logging.info(
+                    f"rank {rank}: updated best model at epoch {epoch}, "
+                    f"selection_score={selection_score:.6f}"
+                )
+            else:
+                num_no_improve_epochs += 1
+                if (
+                    early_stop_patience > 0
+                    and epoch >= early_stop_min_epochs
+                    and num_no_improve_epochs >= early_stop_patience
+                ):
+                    stop_training = True
+                    logging.info(
+                        f"rank {rank}: early stop at epoch {epoch}, "
+                        f"best_epoch={best_epoch}, best_selection_score={best_selection_score:.6f}, "
+                        f"num_no_improve_epochs={num_no_improve_epochs}"
+                    )
         if rank == 0 and epoch > 0 and (epoch % save_ckpt_every_n) == 0:
             torch.save(
                 {
@@ -511,14 +603,25 @@ def train_fn(
 
         logging.info(
             f"rank {rank}: eval @ epoch {epoch} in {time.time() - eval_start_time:.2f}s: "
-            f"NDCG@10 {ndcg_10:.4f}, NDCG@50 {ndcg_50:.4f}, HR@10 {hr_10:.4f}, HR@50 {hr_50:.4f}, MRR {mrr:.4f}"
+            f"NDCG@10 {ndcg_10:.4f}, NDCG@20 {ndcg_20:.4f}, NDCG@50 {ndcg_50:.4f}, "
+            f"HR@10 {hr_10:.4f}, HR@20 {hr_20:.4f}, HR@50 {hr_50:.4f}, "
+            f"MRR {mrr:.4f}, selection_score {selection_score:.6f}"
         )
         last_training_time = time.time()
+        if stop_training:
+            break
 
     if rank == 0:
         if writer is not None:
             writer.flush()
             writer.close()
+
+        if best_epoch >= 0:
+            logging.info(
+                f"Rank {rank}: best_epoch={best_epoch}, "
+                f"best_selection_score={best_selection_score:.6f}, "
+                f"best_ckpt_path={best_ckpt_path}"
+            )
 
         torch.save(
             {
